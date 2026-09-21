@@ -1,26 +1,27 @@
 # event-log-sync-protocol
 
-A Kafka-flavored multi-device sync log backed by SQLite. Append events
-with `POST /events`, pull them back as a stream with `GET /events`.
+一个基于 SQLite 的多端同步事件流协议。设备通过 `POST /events` 追加事件，通过 `GET /events` 拉流回放。
 
-## Run
+[English version](./README.EN.md)
+
+## 运行
 
 ```bash
 pip install flask
-EVENT_LOG_SECRET="your-long-secret-here" python app.py
-# listens on http://127.0.0.1:5000
+EVENT_LOG_SECRET="你的长随机字符串" python app.py
+# 监听 http://127.0.0.1:5000
 ```
 
-Optional env vars:
+可选环境变量：
 
-| var | default | meaning |
+| 变量 | 默认值 | 含义 |
 | --- | --- | --- |
-| `EVENT_LOG_SECRET` | placeholder (change it) | required auth token |
-| `EVENT_LOG_DB` | `events.db` (cwd) | SQLite file path |
+| `EVENT_LOG_SECRET` | 占位符（生产必须改） | 必填的鉴权 token |
+| `EVENT_LOG_DB` | `events.db`（当前目录） | SQLite 文件路径 |
 
 ## API
 
-All requests need `Authorization: <EVENT_LOG_SECRET>`.
+所有请求必须带 `Authorization: <EVENT...RET>`。
 
 ### `POST /events`
 
@@ -35,30 +36,28 @@ All requests need `Authorization: <EVENT_LOG_SECRET>`.
 }
 ```
 
-- `topic` optional; defaults to `__default__`.
-- `data` required for create/update, must be null/absent for delete.
-- Response `201` (new) or `200` (idempotent replay).
-- Server adds `id` (sha256 hash) and `recorded_time` (UTC now).
+- `topic` 可选，默认 `__default__`
+- `create`/`update` 必须带 `data`；`delete` 必须为 null 或不填
+- 响应 `201`（新建）或 `200`（幂等命中）
+- 服务端补 `id`（sha256 哈希）与 `recorded_time`（服务端 UTC 当前时间）
 
 ### `GET /events?since=<recorded_time>&topic=<name>&limit=N`
 
-Returns events strictly after `since`, ordered by `recorded_time` ASC.
-`limit` default 1000, max 10000. Omit `topic` to read all topics.
+返回严格晚于 `since` 的事件，按 `recorded_time` 升序。
+`limit` 默认 1000，上限 10000。不带 `topic` 则查所有 topic。
 
-## Tests
+## 测试
 
 ```bash
 python -m pytest test_app.py -v
 ```
 
-## How sync works
+## 同步原理
 
-1. Each device `POST`s every local change (create/update/delete) with
-   its own clock time as `event_time`.
-2. To catch up, a device calls `GET /events?since=<last_seen_recorded_time>`.
-3. Locally, the device replays the stream against its own snapshot to
-   reach the latest state.
+1. 每台设备把本地变更（create/update/delete）连同自己的时钟时间 `event_time` 一起 `POST`。
+2. 设备要追赶进度时，调用 `GET /events?since=<last_seen_recorded_time>`。
+3. 设备在本地把事件流对自己的快照回放，得到最新状态。
 
-Server timestamps (`recorded_time`) are the source of truth for
-catching up — that's why `since` filters on it. Client `event_time`
-is preserved for audit but not used for ordering.
+服务端时间戳 `recorded_time` 是追赶进度的唯一权威——这就是 `since` 以它为过滤字段的原因。`event_time` 仅作审计，不参与排序。
+
+完整协议见 [PROTOCOL.md](./PROTOCOL.md)。
