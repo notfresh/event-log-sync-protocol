@@ -1,11 +1,10 @@
 """event-log-sync-protocol: SQLite-backed event log HTTP service.
 
-A Kafka-flavored multi-device sync log. Append events with POST, pull
-them back as a stream with GET. Identical POSTs (same topic + device +
-entity + action + event_time) are idempotent: the server returns the
-existing record instead of duplicating.
+Append events with POST, pull them back as a stream with GET. Identical
+POSTs (same topic + device + entity + action + event_time) are
+idempotent: the server returns the existing record instead of duplicating.
 
-See PROTOCOL.md for the wire-format spec (v1).
+See PROTOCOL.md §11 for the server-side contract.
 """
 import hashlib
 import json
@@ -16,21 +15,18 @@ from pathlib import Path
 
 from flask import Flask, g, jsonify, request
 
-# ---- Config ----------------------------------------------------------------
-
 DB_PATH = Path(os.environ.get("EVENT_LOG_DB", "events.db"))
 SECRET = os.environ.get(
     "EVENT_LOG_SECRET",
     "CHANGE-ME-set-the-EVENT_LOG_SECRET-env-var-before-running",
 )
 DEFAULT_TOPIC = "__default__"
-
 VALID_ACTIONS = {"create", "update", "delete"}
+ID_LEN = 16
+MAX_LIMIT = 10000
 
 app = Flask(__name__)
 
-
-# ---- DB --------------------------------------------------------------------
 
 def get_db() -> sqlite3.Connection:
     if "db" not in g:
@@ -41,7 +37,7 @@ def get_db() -> sqlite3.Connection:
             CREATE TABLE IF NOT EXISTS events (
                 id            TEXT PRIMARY KEY,
                 topic         TEXT NOT NULL,
-                recorded_time TEXT NOT NULL,
+                process_time  TEXT NOT NULL,
                 event_time    TEXT NOT NULL,
                 device_id     TEXT NOT NULL,
                 entity_id     TEXT NOT NULL,
@@ -51,8 +47,12 @@ def get_db() -> sqlite3.Connection:
             """
         )
         g.db.execute(
-            "CREATE INDEX IF NOT EXISTS idx_events_topic_recorded "
-            "ON events(topic, recorded_time)"
+            "CREATE INDEX IF NOT EXISTS idx_events_topic_process "
+            "ON events(topic, process_time)"
+        )
+        g.db.execute(
+            "CREATE INDEX IF NOT EXISTS idx_events_topic_event "
+            "ON events(topic, event_time)"
         )
         g.db.commit()
     return g.db
@@ -65,23 +65,17 @@ def close_db(_exc):
         db.close()
 
 
-# ---- Auth ------------------------------------------------------------------
-
 def require_auth() -> bool:
-    """Return True if the request carries a matching Authorization header."""
     return request.headers.get("Authorization", "") == SECRET
 
-
-# ---- Helpers ---------------------------------------------------------------
 
 def compute_id(topic: str, device_id: str, event_time: str,
                entity_id: str, action: str) -> str:
     raw = f"{topic}|{device_id}|{event_time}|{entity_id}|{action}"
-    return hashlib.sha256(raw.encode()).hexdigest()[:16]
+    return hashlib.sha256(raw.encode()).hexdigest()[:ID_LEN]
 
 
-def now_iso() -> str:
-    # Server "wall clock" in UTC ISO-8601 with a Z suffix for clarity.
+def now_utc() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
 
 
@@ -92,7 +86,11 @@ def row_to_dict(row: sqlite3.Row) -> dict:
     return out
 
 
-# ---- Routes ----------------------------------------------------------------
+def err(code: str, message: str, status: int, **extra) -> tuple:
+    body = {"error": code, "message": message}
+    body.update(extra)
+    return jsonify(body), status
+
 
 @app.get("/health")
 def health():
@@ -102,7 +100,7 @@ def health():
 @app.post("/events")
 def post_event():
     if not require_auth():
-        return jsonify(error="unauthorized"), 401
+        return err("unauthorized", "missing or invalid Authorization", 401)
 
     body = request.get_json(silent=True) or {}
     topic = body.get("topic") or DEFAULT_TOPIC
@@ -122,36 +120,34 @@ def post_event():
         if not v
     ]
     if missing:
-        return jsonify(error="missing fields", fields=missing), 400
+        return err("missing_fields", "required fields are empty",
+                   400, fields=missing)
 
     if action not in VALID_ACTIONS:
-        return jsonify(
-            error="invalid action",
-            action=action,
-            allowed=sorted(VALID_ACTIONS),
-        ), 400
+        return err("invalid_action", "action not allowed",
+                   400, action=action,
+                   allowed=sorted(VALID_ACTIONS))
 
     if action == "delete":
         data = None
     elif data is None:
-        return jsonify(error="data is required for non-delete actions"), 400
+        return err("data_required", "data required for non-delete actions", 400)
 
+    client_id = body.get("id")
     eid = compute_id(topic, device_id, event_time, entity_id, action)
-    recorded = now_iso()
 
     db = get_db()
     existing = db.execute(
         "SELECT * FROM events WHERE id = ?", (eid,)
     ).fetchone()
     if existing is not None:
-        # Idempotent: same event posted twice => same record.
         return jsonify(row_to_dict(existing)), 200
 
     db.execute(
         "INSERT INTO events "
-        "(id, topic, recorded_time, event_time, device_id, entity_id, "
+        "(id, topic, process_time, event_time, device_id, entity_id, "
         "action, data) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-        (eid, topic, recorded, event_time, device_id, entity_id,
+        (eid, topic, now_utc(), event_time, device_id, entity_id,
          action, json.dumps(data) if data is not None else None),
     )
     db.commit()
@@ -159,7 +155,7 @@ def post_event():
     return jsonify(
         id=eid,
         topic=topic,
-        recorded_time=recorded,
+        process_time=now_utc(),
         event_time=event_time,
         device_id=device_id,
         entity_id=entity_id,
@@ -171,22 +167,28 @@ def post_event():
 @app.get("/events")
 def get_events():
     if not require_auth():
-        return jsonify(error="unauthorized"), 401
+        return err("unauthorized", "missing or invalid Authorization", 401)
 
     since = request.args.get("since", "")
     topic = request.args.get("topic")
+    order = request.args.get("order", "process_time")
+    if order not in ("process_time", "event_time"):
+        return err("invalid_order",
+                   "order must be 'process_time' or 'event_time'",
+                   400, order=order)
+
     try:
         limit = int(request.args.get("limit", "1000"))
     except ValueError:
-        return jsonify(error="limit must be an integer"), 400
-    limit = max(1, min(limit, 10000))
+        return err("invalid_limit", "limit must be an integer", 400)
+    limit = max(1, min(limit, MAX_LIMIT))
 
-    sql = "SELECT * FROM events WHERE recorded_time > ?"
+    sql = f"SELECT * FROM events WHERE {order} > ?"
     params: list = [since]
     if topic:
         sql += " AND topic = ?"
         params.append(topic)
-    sql += " ORDER BY recorded_time ASC LIMIT ?"
+    sql += f" ORDER BY {order} ASC LIMIT ?"
     params.append(limit)
 
     rows = get_db().execute(sql, params).fetchall()

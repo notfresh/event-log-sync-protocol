@@ -40,12 +40,13 @@ All requests need `Authorization: <EVENT...T>`.
 - `topic` optional; defaults to `__default__`.
 - `data` required for create/update, must be null/absent for delete.
 - Response `201` (new) or `200` (idempotent replay).
-- Server adds `id` (sha256 hash) and `recorded_time` (UTC now).
+- Server adds `id` (client-supplied sha256 first 16 hex, server validates) and `process_time` (server-side UTC now).
 
-### `GET /events?since=<recorded_time>&topic=<name>&limit=N`
+### `GET /events?since=<process_time>&topic=<name>&limit=<N>`
 
-Returns events strictly after `since`, ordered by `recorded_time` ASC.
+Returns events strictly after `since`, ordered by `process_time` ASC.
 `limit` default 1000, max 10000. Omit `topic` to read all topics.
+Add `order=event_time` to filter by `event_time` instead (single-end scenario, see PROTOCOL §11.6).
 
 ## Tests
 
@@ -56,13 +57,16 @@ python -m pytest test_app.py -v
 ## How sync works
 
 1. Each device `POST`s every local change (create/update/delete) with
-   its own clock time as `event_time`.
-2. To catch up, a device calls `GET /events?since=<last_seen_recorded_time>`.
+   the entity's true creation time as `event_time`.
+2. To catch up, a device calls `GET /events?since=<last_seen_process_time>`.
 3. Locally, the device replays the stream against its own snapshot to
    reach the latest state.
 
-Server timestamps (`recorded_time`) are the source of truth for
-catching up — that's why `since` filters on it. Client `event_time`
-is preserved for audit but not used for ordering.
+Server timestamps (`process_time`) are the source of truth for
+catching up — that's why `since` filters on it by default. Client
+`event_time` is the entity's true creation time (local timezone with
+`+HH:MM` offset), preserved for audit but not used for multi-device
+ordering. See PROTOCOL.md §2.5 for the semantic distinction between
+the two time fields.
 
 See [PROTOCOL.md](./PROTOCOL.md) for the full wire-format spec.
