@@ -98,43 +98,73 @@ def health():
 
 
 @app.post("/events")
-def post_event():
+def post_events():
+    """Single or batch write — per PROTOCOL §4.1.
+
+    Body shape decides branch:
+      - {"events": [...]}  → batch (length 1..1000)
+      - <event object>      → single event
+    """
     if not require_auth():
         return err("unauthorized", "missing or invalid Authorization", 401)
 
-    body = request.get_json(silent=True) or {}
-    topic = body.get("topic") or DEFAULT_TOPIC
-    device_id = body.get("device_id")
-    entity_id = body.get("entity_id")
-    action = body.get("action")
-    event_time = body.get("event_time")
-    data = body.get("data")
+    body = request.get_json(silent=True)
+    if not isinstance(body, dict):
+        return err("missing_fields", "request body must be a JSON object", 400)
 
+    if isinstance(body.get("events"), list):
+        return _write_batch(body["events"])
+    return _write_single(body)
+
+
+def _validate_event_fields(ev: dict) -> tuple | None:
+    """Return an error response tuple if invalid, else None."""
+    if not isinstance(ev, dict):
+        return err("missing_fields", "event entry must be an object", 400)
     missing = [
         k for k, v in {
-            "device_id": device_id,
-            "entity_id": entity_id,
-            "action": action,
-            "event_time": event_time,
+            "device_id": ev.get("device_id"),
+            "entity_id": ev.get("entity_id"),
+            "action": ev.get("action"),
+            "event_time": ev.get("event_time"),
         }.items()
         if not v
     ]
     if missing:
         return err("missing_fields", "required fields are empty",
                    400, fields=missing)
-
+    action = ev.get("action")
     if action not in VALID_ACTIONS:
         return err("invalid_action", "action not allowed",
                    400, action=action,
                    allowed=sorted(VALID_ACTIONS))
-
     if action == "delete":
-        data = None
-    elif data is None:
-        return err("data_required", "data required for non-delete actions", 400)
+        return None
+    if ev.get("data") is None:
+        return err("data_required",
+                   "data required for non-delete actions", 400)
+    return None
 
-    client_id = body.get("id")
+
+def _write_single(body: dict):
+    """Insert one event (or return existing on id hit). Returns 201 / 200."""
+    fail = _validate_event_fields(body)
+    if fail is not None:
+        return fail
+
+    topic = body.get("topic") or DEFAULT_TOPIC
+    device_id = body["device_id"]
+    entity_id = body["entity_id"]
+    action = body["action"]
+    event_time = body["event_time"]
+    data = None if action == "delete" else body.get("data")
+
     eid = compute_id(topic, device_id, event_time, entity_id, action)
+    client_id = body.get("id")
+    if client_id is not None and client_id != eid:
+        return err("id_mismatch",
+                   "client id does not match computed id",
+                   400, expected=eid, received=client_id)
 
     db = get_db()
     existing = db.execute(
@@ -164,63 +194,28 @@ def post_event():
     ), 201
 
 
-@app.post("/events/batch")
-def post_events_batch():
-    """Batch endpoint per PROTOCOL §4.1.1.
-
-    Body: {"events": [<event>, ...]}. The server writes each event
-    independently (no all-or-nothing atomicity). On ANY single failure
-    the whole batch responds non-2xx so the client leaves its push
-    cursor untouched — duplicate retry is safe via id-based idempotency.
-    """
-    if not require_auth():
-        return err("unauthorized", "missing or invalid Authorization", 401)
-
-    body = request.get_json(silent=True) or {}
-    events = body.get("events")
-    if not isinstance(events, list) or not events:
+def _write_batch(events: list):
+    """Write each event independently. Any single failure → whole batch
+    non-2xx so client leaves its push cursor untouched (idempotent retry)."""
+    if not events:
         return err("missing_fields", "events array is required", 400)
     if len(events) > 1000:
-        return err("batch_too_large",
-                   "events array exceeds 1000", 400)
+        return err("batch_too_large", "events array exceeds 1000", 400)
 
-    # Whole-batch validation up-front (per §4.1.1: any required field
-    # missing → reject whole batch, no partial writes).
+    # Up-front whole-batch validation (any required field missing →
+    # reject whole batch, no partial writes).
     for ev in events:
-        if not isinstance(ev, dict):
-            return err("missing_fields", "event entry must be an object",
-                       400)
-        missing = [
-            k for k, v in {
-                "device_id": ev.get("device_id"),
-                "entity_id": ev.get("entity_id"),
-                "action": ev.get("action"),
-                "event_time": ev.get("event_time"),
-            }.items()
-            if not v
-        ]
-        if missing:
-            return err("missing_fields", "required fields are empty",
-                       400, fields=missing)
-        action = ev.get("action")
-        if action not in VALID_ACTIONS:
-            return err("invalid_action", "action not allowed",
-                       400, action=action,
-                       allowed=sorted(VALID_ACTIONS))
-        if action == "delete":
-            continue
-        if ev.get("data") is None:
-            return err("data_required",
-                       "data required for non-delete actions", 400)
+        fail = _validate_event_fields(ev)
+        if fail is not None:
+            return fail
 
-    # All validation passed — proceed to write each event.
     db = get_db()
     results = []
     total_new = 0
     total_duplicate = 0
-    pt = now_utc()  # single timestamp for the whole batch — keeps id
-                     # stability when the client re-sends the same batch
-                     # with the same client-side process_time values.
+    # Single timestamp for the whole batch — keeps re-send of the same
+    # batch stable for the response shape (process_time is server-authoritative).
+    pt = now_utc()
     for ev in events:
         topic = ev.get("topic") or DEFAULT_TOPIC
         device_id = ev["device_id"]
@@ -265,13 +260,29 @@ def post_events_batch():
         total_new += 1
 
     db.commit()
-    # 201 if all new, 200 if all duplicate or mixed — same body either way.
     status_code = 201 if total_new > 0 and total_duplicate == 0 else 200
     return jsonify(
         results=results,
         total_new=total_new,
         total_duplicate=total_duplicate,
     ), status_code
+
+
+@app.post("/events/batch")
+def post_events_batch():
+    """DEPRECATED — kept only as a transient alias during the §4.1
+    merger. Use POST /events with a {"events": [...]} body instead.
+    """
+    if not require_auth():
+        return err("unauthorized", "missing or invalid Authorization", 401)
+    body = request.get_json(silent=True) or {}
+    events = body.get("events")
+    if not isinstance(events, list) or not events:
+        return err("missing_fields", "events array is required", 400)
+    if len(events) > 1000:
+        return err("batch_too_large",
+                   "events array exceeds 1000", 400)
+    return _write_batch(events)
 
 
 @app.get("/events")
