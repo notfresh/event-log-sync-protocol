@@ -288,11 +288,121 @@ Content-Type: application/json
 }
 ```
 
-### 4.2 `GET /events`
+### 4.1.1 `POST /events/batch`
 
-按时间窗拉取事件。
+批量写入多条事件。**客户端**用于把本地已落库的一批事件一次性推送到服务端。服务端**逐条写入**（不要求整批原子），每条独立走 §4.1 的幂等去重逻辑。
+
+**为什么需要批量接口：**
+
+客户端业务可能在短时间内产生大量事件（bootstrap 灌历史、批处理、夜间补录）。逐条 POST 浪费 RTT，且服务端处理逻辑里 schema 校验 + 幂等检查是按条做的，批量只是"客户端多打几个包"——服务端不需要新逻辑。批量接口让客户端少打 N-1 次 RTT。
 
 **请求：**
+
+```http
+POST /events/batch
+Authorization: ***
+Content-Type: application/json
+
+{
+  "events": [
+    {
+      "id":          "228703dbe5e78fec",
+      "device_id":   "phone-1",
+      "topic":       "notes",
+      "entity_id":   "note-42",
+      "action":      "create",
+      "event_time":  "2026-09-03T12:00:00.123+08:00",
+      "data": { "title": "Hello" }
+    },
+    {
+      "id":          "3a8f12bc7e9d44a1",
+      "device_id":   "phone-1",
+      "topic":       "notes",
+      "entity_id":   "note-43",
+      "action":      "create",
+      "event_time":  "2026-09-03T12:00:01.456+08:00",
+      "data": { "title": "World" }
+    }
+  ]
+}
+```
+
+| 字段 | 必填 | 说明 |
+|------|------|------|
+| `events` | 是 | 非空数组，长度 `1..1000`（超过服务端应返 `400 batch_too_large`） |
+| `events[].id` | 否（建议上传） | 服务端校验与五元组 sha256 是否匹配；不上传则服务端代为计算（兼容模式） |
+| `events[].device_id` / `topic` / `entity_id` / `action` / `event_time` | 是 | 任一缺失或空串 → `400 missing_fields`，**整批拒绝**（不逐条校验） |
+| `events[].data` | create/update 必填；delete 必须为 null | 不符合 → `400 data_required` 或服务端强制置 null，**整批拒绝** |
+
+**服务端处理：**
+
+```
+for each event in batch:
+    按 §4.1 同样的逻辑校验 + 写入
+    记录该条的 status（200 幂等命中 / 201 新增）
+    单条失败（如五元组冲突）→ 整批响应非 2xx，客户端按整批失败处理
+```
+
+**整批原子性：** **不要求**。服务端逐条写，某条失败不影响其他条写入。但响应里**只要出现任意一条写入失败，整批响应非 2xx**，客户端 cursor 不前进（参见 §10.5 PUSH 流程）。
+
+**响应（成功）：**
+
+`200 OK`（部分幂等命中）或 `201 Created`（全部新增）：
+
+```json
+{
+  "results": [
+    { "index": 0, "status": 201, "id": "228703dbe5e78fec", "process_time": "2026-09-03T14:53:26.652190Z" },
+    { "index": 1, "status": 200, "id": "3a8f12bc7e9d44a1", "process_time": "2026-09-03T14:53:26.654901Z" }
+  ],
+  "total_new": 1,
+  "total_duplicate": 1
+}
+```
+
+| 字段 | 含义 |
+|------|------|
+| `results[].index` | 请求数组中的下标 |
+| `results[].status` | 该条独立结果：`200` 幂等命中 / `201` 新增 |
+| `results[].id` | 该事件 id（客户端上传值或服务端计算值，原样回传） |
+| `results[].process_time` | 服务端入库瞬间的 UTC 时间（§11.1 服务端权威字段）。客户端 POST 时该字段必填但**会被服务端覆盖**——客户端填本地入库时间即可，仅作占位 |
+| `total_new` / `total_duplicate` | 整批汇总 |
+
+**响应（失败）：**
+
+| 状态码 | error code | 含义 | 何时 |
+|--------|-----------|------|------|
+| `400` | `missing_fields` | 整批缺字段 | 任一 event 必填字段缺失 |
+| `400` | `invalid_action` | 整批 action 非法 | 任一 event action 不在白名单 |
+| `400` | `data_required` | 整批缺 data | 任一 create/update event 缺 data |
+| `400` | `id_mismatch` | 整批 id 不匹配 | 任一 event 的 id 与五元组 sha256 不一致 |
+| `400` | `batch_too_large` | 超过长度上限 | events 数组长度 > 1000 |
+| `401` | `unauthorized` | 鉴权失败 | Authorization 缺失或不匹配 |
+| `500` | `internal_error` | 服务端内部错误 | 数据库失败等 |
+
+> **整批失败时响应里不带 `results`**——失败发生在校验阶段，事件尚未进入写入流程。
+
+**客户端决策（§10.5 PUSH 流程）：**
+
+```
+resp = POST /events/batch {events: batch}
+if resp.status in {200, 201}:
+    set_cursor(topic, "push", batch[-1].process_time)   # 整批原子推进
+    return len(batch)
+else:
+    # 整批失败：cursor 不动；下轮重推同一批，服务端按 id 幂等去重
+    return -1
+```
+
+**幂等保证：**
+
+- 重推同一批：服务端按 id 命中已存在记录，返 200 + 原 process_time，不产生重复行
+- 部分重推（客户端断点重推）：服务端从 `id` 去重，已存在的返 200，新增的返 201
+- 客户端无需记录"上次推到哪里之前哪些条已成功"——整批原子推进，失败整批重推即可
+
+### 4.2 `GET /events`
+
+按时间窗拉取事件。**请求：**
 
 ```http
 GET /events?since=<process_time>&topic=<name>&limit=<N>
@@ -630,7 +740,8 @@ class EventLogClient:
 
 | 部署 | 协议偏离条款 | 备注 |
 |---|---|---|
-| `notfresh/reading-share-android`（事件日志模块） | §10.1 + §10.2 | 无服务端；UI 暴露"清空事件"按钮；翻页用 `event_time`；bootstrap 灌历史时 `event_time = links.timestamp` |
+| `notfresh/reading-share-android`（事件日志模块，早期） | §10.1 + §10.2 | 无服务端；UI 暴露"清空事件"按钮；翻页用 `event_time`；bootstrap 灌历史时 `event_time = links.timestamp` |
+| `notfresh/reading-share-android`（事件日志模块，当前） | §10.5 | 多端双向；服务端作防丢失管道（详见 §10.5） |
 
 如有新部署案例，按相同格式补充。
 
@@ -671,6 +782,121 @@ UI 只做"读"和"清空"——不参与同步流程。客户端业务代码在�
 #### 参考实现
 
 `notfresh/reading-share-android/EventLogActivity.java` — Android 实现，约 160 行，复用 `EventLogClient` API。
+
+---
+
+### 10.5 多端双向部署：服务端作防丢失管道
+
+本节描述 `notfresh/reading-share-android` 当前形态：多端部署 + 双向同步（push 上行 + pull 下行）+ 服务端纯管道。**与 §10.1+§10.2 单端、§11.1 多端默认部署均有偏离**。
+
+#### 部署假设
+
+- **多端**：每个客户端同时是事件的生产者和消费者。设备间互不信任时钟，但容忍最终不一致。
+- **服务端 = 防丢失管道**：服务端只做"收下客户端 POST 来的事件、按 `id` 幂等去重、按时间窗口 GET 给客户端"。**服务端不分配、不存储、不维护任何客户端游标**——客户端游标是客户端私有状态。
+- **无强一致性要求**：事件流被视作"丢了可惜但不阻塞业务"的备份通道；客户端真相是各端自己的本地状态，服务端只是兜底。
+
+#### 双游标契约
+
+每个 topic，客户端独立维护两套游标：
+
+| 游标 | 字段来源 | 何时推进 |
+|------|----------|----------|
+| **push sync_point** | 客户端本地入库时的 `process_time`（POST body 中已发的那个） | `POST /events/batch` 返回 200/201 后整批原子推进 |
+| **pull sync_point** | 服务端响应中每条事件的 `process_time` 字段（服务端入库瞬间，权威） | `GET /events` 拉到的 batch 中取 `max(process_time)`，本批应用后持久化 |
+
+两套游标**互相独立、可分别持久化在客户端不同 key 下**（具体存储格式由客户端决定，本协议不规定）。两套游标**可以不同步**——push 推进不代表 pull 推进，反之亦然。
+
+#### 游标 key 必须包含 server_url
+
+**协议要求**：客户端持久化游标时，**key 必须包含 server_url**——形式上等价于 `{push|pull}:{server_url}:{topic}` 或客户端自定义的等价结构，但语义上必须满足：
+
+1. **同一 topic 在不同 server 下的游标互相独立**，互不影响。
+2. **服务端可自由更换**（客户端配置变更、调试、多 server 并存等场景）——切换后旧 server 下的游标**保留可用**（客户端切回去时旧游标仍生效，无需重新冷启动）。
+3. 新 server 首次推送/拉取时游标为 `null`（从未同步过），走冷启动流程。
+
+**为什么是协议要求而非实现细节：**
+
+服务端是**防丢失管道**——切换服务端不应让客户端丢历史同步进度。如果 key 不带 server_url，"换服务端"就被耦合死，违反"管道可替换"的部署假设。
+
+服务端契约（参见 §10.5 服务端契约表）**不强制**要求服务端在多 server 间共享数据——多个 server 实例可以是完全独立的部署，客户端在它们之间切换互不感知。
+
+#### PUSH 流程
+
+整批推送。客户端按本地 process_time 升序取一批（默认 100 条/批，上限 1000 条/批），一次性 `POST /events/batch`，服务端逐条写入（§4.1.1 不要求原子）。任一条写入失败 → 整批响应非 2xx → 客户端 cursor 不动，下轮重推同一批由服务端按 `id` 幂等去重兜底。
+
+```text
+push_pending(topic):
+    cursor = get_cursor(topic, "push")               # 可能是 null（首次推送）
+    batch  = local_store.since_by_process_time(topic, cursor, BATCH_LIMIT)  # 默认 100
+    if not batch: return 0
+    resp = POST /events/batch {events: batch}        # §4.1.1 批量接口
+    if resp.status in {200, 201}:
+        # 整批原子推进：cursor 直接跳到 batch 末尾
+        set_cursor(topic, "push", batch[-1].process_time)   # 本地入库 process_time
+        return len(batch)
+    else:
+        # 整批失败：cursor 不动；下轮重推同一批由服务端 §4.1.1 幂等去重
+        # §6 错误处理：401/400 不重试；5xx 指数退避（客户端自行实现）
+        return -1
+```
+
+- `cursor = null` 视为"从未推过"，`since(null)` 返回 topic 下全部事件
+- POST body 中每条 event 的 `process_time` 字段**必填但会被服务端覆盖为入库时间**——客户端填本地入库时间作占位即可（§11.1）
+- BATCH_LIMIT 客户端默认 100（可配置，1..1000）；过小浪费 RTT，过大单请求超时风险
+- **逐条重推优化（可选）**：整批失败时，客户端可降级为逐条 POST 找出"哪条真的失败"——但本部署默认不启用，靠下轮整批重推 + 服务端幂等兜底
+
+#### PULL 流程
+
+按 §5.2 冷启动 + §5.3 增量同步执行，**唯一差异是游标字段用 `process_time`**（多端默认）：
+
+```text
+pull(topic):
+    cursor = get_cursor(topic, "pull")               # null → 冷启动
+    if cursor is null:
+        events = GET /events?since=&topic=<t>&limit=10000
+        apply_events(events)                         # §5.4 LWW by process_time
+        if events: set_cursor(topic, "pull", max(e.process_time for e in events))
+    else:
+        # §5.3 增量循环：每次拉满 limit 即用 batch[-1].process_time 推进，避免内存爆炸
+        while True:
+            batch = GET /events?since=<cursor>&topic=<t>&limit=10000
+            if not batch: break
+            apply_events(batch)
+            cursor = batch[-1].process_time
+            if len(batch) < 10000: break
+        set_cursor(topic, "pull", cursor)
+```
+
+- 服务端不存任何客户端 pull 游标；客户端自己存
+- LWW 比较使用服务端 process_time（§5.4 默认字段，多端下）
+- 失败处理：5xx 指数退避，pull cursor 不前进；401/400 不重试
+
+#### 服务端契约（本部署下的服务端实现要点）
+
+| 服务端应该做 | 服务端不应该做 |
+|---|---|
+| 接收 `POST /events` 并按 `id` 幂等去重持久化 | 给事件覆盖 `process_time`（保留客户端原值） |
+| 按 `topic` + 时间窗口提供 `GET /events` | 存储/维护任何客户端游标 |
+| 鉴权（共享密钥 §2） | 校验 `event_time` / `device_id` |
+| 返回客户端 POST 时给的 `process_time` 原样 | 提供 entity 状态查询 / 主动推送 / 实时接口 |
+
+#### 与 §10.1+§10.2 单端的差异
+
+| 项 | §10.1+§10.2 单端 | §10.5 多端管道（本部署） |
+|---|---|---|
+| 服务端 | 无 | 有，作防丢失管道 |
+| 同步方向 | 仅本地写入 | push + pull 双向 |
+| sync_point | 不需要（用 `event_time` 翻页） | 双套：push 用本地 process_time，pull 用服务端 process_time |
+| LWW 折叠 | 不需要（单端无冲突） | 需要（§5.4 by process_time） |
+| process_time 语义 | 本地处理时间（参考） | 服务端入库时间（覆盖客户端原值，§11.1 权威字段） |
+
+#### 与 §11.1 默认多端的差异
+
+| 项 | §11.1 默认多端 | §10.5 多端管道（本部署） |
+|---|---|---|
+| process_time 权威方 | 服务端覆盖为入库时间 | 服务端覆盖为入库时间（同 §11.1；客户端 POST 时该字段必填但会被服务端覆盖） |
+| 一致性保证 | 多端最终一致 | 无一致性保证（防丢失优先） |
+| 客户端时钟假设 | 不可信，靠服务端对齐 | 各端独立时钟，业务容错 |
 
 ---
 
