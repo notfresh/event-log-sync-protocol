@@ -216,7 +216,12 @@ EventLogClient.get().create(topic, entityId, dataJson);  // SDK 默认 now() 会
 
 ### 4.1 `POST /events`
 
-写入一条事件。重复请求（由 id 决定）服务端返回原记录而非新增。
+写入一条或多条事件。服务端按 body 结构识别是单条还是批量：
+
+- **单条**：body 直接是一个 event 对象（见下方"单条 body"）。
+- **批量**：body 含 `events` 数组字段（见下方"批量 body"），服务端逐条写入（不要求整批原子）。
+
+重复请求（由 id 决定）服务端返回原记录而非新增。
 
 **请求：**
 
@@ -287,118 +292,6 @@ Content-Type: application/json
   "data":          { "title": "Hello", "body": "First sync" }
 }
 ```
-
-### 4.1.1 `POST /events/batch`
-
-批量写入多条事件。**客户端**用于把本地已落库的一批事件一次性推送到服务端。服务端**逐条写入**（不要求整批原子），每条独立走 §4.1 的幂等去重逻辑。
-
-**为什么需要批量接口：**
-
-客户端业务可能在短时间内产生大量事件（bootstrap 灌历史、批处理、夜间补录）。逐条 POST 浪费 RTT，且服务端处理逻辑里 schema 校验 + 幂等检查是按条做的，批量只是"客户端多打几个包"——服务端不需要新逻辑。批量接口让客户端少打 N-1 次 RTT。
-
-**请求：**
-
-```http
-POST /events/batch
-Authorization: ***
-Content-Type: application/json
-
-{
-  "events": [
-    {
-      "id":          "228703dbe5e78fec",
-      "device_id":   "phone-1",
-      "topic":       "notes",
-      "entity_id":   "note-42",
-      "action":      "create",
-      "event_time":  "2026-09-03T12:00:00.123+08:00",
-      "data": { "title": "Hello" }
-    },
-    {
-      "id":          "3a8f12bc7e9d44a1",
-      "device_id":   "phone-1",
-      "topic":       "notes",
-      "entity_id":   "note-43",
-      "action":      "create",
-      "event_time":  "2026-09-03T12:00:01.456+08:00",
-      "data": { "title": "World" }
-    }
-  ]
-}
-```
-
-| 字段 | 必填 | 说明 |
-|------|------|------|
-| `events` | 是 | 非空数组，长度 `1..1000`（超过服务端应返 `400 batch_too_large`） |
-| `events[].id` | 否（建议上传） | 服务端校验与五元组 sha256 是否匹配；不上传则服务端代为计算（兼容模式） |
-| `events[].device_id` / `topic` / `entity_id` / `action` / `event_time` | 是 | 任一缺失或空串 → `400 missing_fields`，**整批拒绝**（不逐条校验） |
-| `events[].data` | create/update 必填；delete 必须为 null | 不符合 → `400 data_required` 或服务端强制置 null，**整批拒绝** |
-
-**服务端处理：**
-
-```
-for each event in batch:
-    按 §4.1 同样的逻辑校验 + 写入
-    记录该条的 status（200 幂等命中 / 201 新增）
-    单条失败（如五元组冲突）→ 整批响应非 2xx，客户端按整批失败处理
-```
-
-**整批原子性：** **不要求**。服务端逐条写，某条失败不影响其他条写入。但响应里**只要出现任意一条写入失败，整批响应非 2xx**，客户端 cursor 不前进（参见 §10.5 PUSH 流程）。
-
-**响应（成功）：**
-
-`200 OK`（部分幂等命中）或 `201 Created`（全部新增）：
-
-```json
-{
-  "results": [
-    { "index": 0, "status": 201, "id": "228703dbe5e78fec", "process_time": "2026-09-03T14:53:26.652190Z" },
-    { "index": 1, "status": 200, "id": "3a8f12bc7e9d44a1", "process_time": "2026-09-03T14:53:26.654901Z" }
-  ],
-  "total_new": 1,
-  "total_duplicate": 1
-}
-```
-
-| 字段 | 含义 |
-|------|------|
-| `results[].index` | 请求数组中的下标 |
-| `results[].status` | 该条独立结果：`200` 幂等命中 / `201` 新增 |
-| `results[].id` | 该事件 id（客户端上传值或服务端计算值，原样回传） |
-| `results[].process_time` | 服务端入库瞬间的 UTC 时间（§11.1 服务端权威字段）。客户端 POST 时该字段必填但**会被服务端覆盖**——客户端填本地入库时间即可，仅作占位 |
-| `total_new` / `total_duplicate` | 整批汇总 |
-
-**响应（失败）：**
-
-| 状态码 | error code | 含义 | 何时 |
-|--------|-----------|------|------|
-| `400` | `missing_fields` | 整批缺字段 | 任一 event 必填字段缺失 |
-| `400` | `invalid_action` | 整批 action 非法 | 任一 event action 不在白名单 |
-| `400` | `data_required` | 整批缺 data | 任一 create/update event 缺 data |
-| `400` | `id_mismatch` | 整批 id 不匹配 | 任一 event 的 id 与五元组 sha256 不一致 |
-| `400` | `batch_too_large` | 超过长度上限 | events 数组长度 > 1000 |
-| `401` | `unauthorized` | 鉴权失败 | Authorization 缺失或不匹配 |
-| `500` | `internal_error` | 服务端内部错误 | 数据库失败等 |
-
-> **整批失败时响应里不带 `results`**——失败发生在校验阶段，事件尚未进入写入流程。
-
-**客户端决策（§10.5 PUSH 流程）：**
-
-```
-resp = POST /events/batch {events: batch}
-if resp.status in {200, 201}:
-    set_cursor(topic, "push", batch[-1].process_time)   # 整批原子推进
-    return len(batch)
-else:
-    # 整批失败：cursor 不动；下轮重推同一批，服务端按 id 幂等去重
-    return -1
-```
-
-**幂等保证：**
-
-- 重推同一批：服务端按 id 命中已存在记录，返 200 + 原 process_time，不产生重复行
-- 部分重推（客户端断点重推）：服务端从 `id` 去重，已存在的返 200，新增的返 201
-- 客户端无需记录"上次推到哪里之前哪些条已成功"——整批原子推进，失败整批重推即可
 
 ### 4.2 `GET /events`
 
@@ -801,7 +694,7 @@ UI 只做"读"和"清空"——不参与同步流程。客户端业务代码在�
 
 | 游标 | 字段来源 | 何时推进 |
 |------|----------|----------|
-| **push sync_point** | 客户端本地入库时的 `process_time`（POST body 中已发的那个） | `POST /events/batch` 返回 200/201 后整批原子推进 |
+| **push sync_point** | 客户端本地入库时的 `process_time`（POST body 中已发的那个） | `POST /events`（批量 body）返回 200/201 后整批原子推进 |
 | **pull sync_point** | 服务端响应中每条事件的 `process_time` 字段（服务端入库瞬间，权威） | `GET /events` 拉到的 batch 中取 `max(process_time)`，本批应用后持久化 |
 
 两套游标**互相独立、可分别持久化在客户端不同 key 下**（具体存储格式由客户端决定，本协议不规定）。两套游标**可以不同步**——push 推进不代表 pull 推进，反之亦然。
@@ -822,20 +715,20 @@ UI 只做"读"和"清空"——不参与同步流程。客户端业务代码在�
 
 #### PUSH 流程
 
-整批推送。客户端按本地 process_time 升序取一批（默认 100 条/批，上限 1000 条/批），一次性 `POST /events/batch`，服务端逐条写入（§4.1.1 不要求原子）。任一条写入失败 → 整批响应非 2xx → 客户端 cursor 不动，下轮重推同一批由服务端按 `id` 幂等去重兜底。
+整批推送。客户端按本地 process_time 升序取一批（默认 100 条/批，上限 1000 条/批），一次性 `POST /events`（body 为 `{events: [...]}`），服务端逐条写入（§4.1 批量 body 不要求原子）。任一条写入失败 → 整批响应非 2xx → 客户端 cursor 不动，下轮重推同一批由服务端按 `id` 幂等去重兜底。
 
 ```text
 push_pending(topic):
     cursor = get_cursor(topic, "push")               # 可能是 null（首次推送）
     batch  = local_store.since_by_process_time(topic, cursor, BATCH_LIMIT)  # 默认 100
     if not batch: return 0
-    resp = POST /events/batch {events: batch}        # §4.1.1 批量接口
+    resp = POST /events {events: batch}        # §4.1 批量 body
     if resp.status in {200, 201}:
         # 整批原子推进：cursor 直接跳到 batch 末尾
         set_cursor(topic, "push", batch[-1].process_time)   # 本地入库 process_time
         return len(batch)
     else:
-        # 整批失败：cursor 不动；下轮重推同一批由服务端 §4.1.1 幂等去重
+        # 整批失败：cursor 不动；下轮重推同一批由服务端 §4.1 幂等去重
         # §6 错误处理：401/400 不重试；5xx 指数退避（客户端自行实现）
         return -1
 ```
