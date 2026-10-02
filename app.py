@@ -181,11 +181,10 @@ def _write_single(body: dict):
     data = None if action == "delete" else body.get("data")
 
     eid = compute_id(topic, device_id, event_time, entity_id, action)
-    client_id = body.get("id")
-    if client_id is not None and client_id != eid:
-        return err("id_mismatch",
-                   "client id does not match computed id",
-                   400, expected=eid, received=client_id)
+    # NOTE(id_mismatch 豁免): 不再强制要求 client_id == eid。
+    # 原因 — 客户端 ANDROID_ID 重装后会变化,五元组 hash 因此洗牌;
+    # 服务端只关心事件数据本身,不需要客户端 device_id 与算出的 eid 完全一致。
+    # 服务端按接收到的 device_id 算 eid,做幂等查询/插入。
 
     db = get_db()
     existing = db.execute(
@@ -246,11 +245,7 @@ def _write_batch(events: list):
         data = None if action == "delete" else ev.get("data")
 
         eid = compute_id(topic, device_id, event_time, entity_id, action)
-        client_id = ev.get("id")
-        if client_id is not None and client_id != eid:
-            return err("id_mismatch",
-                       "client id does not match computed id",
-                       400, expected=eid, received=client_id)
+        # NOTE: 同样豁免 id_mismatch(原因见 _write_single)
 
         existing = db.execute(
             "SELECT * FROM events WHERE id = ?", (eid,)
