@@ -97,6 +97,27 @@ def health():
     return jsonify(status="ok")
 
 
+@app.get("/stats")
+def stats():
+    """Simple observability — total event count and per-topic breakdown.
+
+    Open http://<host>/stats with curl + Authorization header (or any
+    HTTP client that lets you set headers). Intended for human inspection
+    during local testing, not for client use.
+    """
+    if not require_auth():
+        return err("unauthorized", "missing or invalid Authorization", 401)
+    db = get_db()
+    total = db.execute("SELECT COUNT(*) FROM events").fetchone()[0]
+    by_topic = db.execute(
+        "SELECT topic, COUNT(*) AS n FROM events GROUP BY topic ORDER BY n DESC"
+    ).fetchall()
+    return jsonify(
+        total=total,
+        by_topic=[{"topic": r["topic"], "count": r["n"]} for r in by_topic],
+    )
+
+
 @app.post("/events")
 def post_events():
     """Single or batch write — per PROTOCOL §4.1.
@@ -317,4 +338,7 @@ def get_events():
 
 
 if __name__ == "__main__":
-    app.run(host="127.0.0.1", port=5000, debug=False)
+    # Listen on all interfaces so the server is reachable from outside
+    # the box (port 80 is exposed on this host per project convention).
+    # Run as root or under sudo to bind a privileged port.
+    app.run(host="0.0.0.0", port=80, debug=False)
