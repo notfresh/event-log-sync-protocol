@@ -28,7 +28,7 @@
 | # | 不变量 | 含义 |
 |---|--------|------|
 | 1 | 事件不可变 | 已写入的事件永远不会被修改。但允许**部署级**显式清空（如离线客户端 UI 提供清空按钮）。详见 §10.1 |
-| 2 | `process_time` 在同 topic 内单调递增 | 多端场景下服务端保证严格递增；单端场景下允许同毫秒内产生相同 `process_time` |
+| 2 | `process_time` 在同 topic 内单调递增 | 多端场景（§10.5）下写入方必须保证**严格递增**（同毫秒内逐条递增 1ms）——push 游标按「严格大于」推进，同值重复会永久跳过同值的剩余事件；单端场景下允许同毫秒内产生相同 `process_time`（游标用 `event_time`，见 §10.2） |
 | 3 | 重复写入幂等 | 同 `(topic, device_id, event_time, entity_id, action)` 的请求返回同一记录（id 公式稳定） |
 | 4 | 客户端是状态权威 | 服务端不折叠，客户端拉到自己本地合成当前状态 |
 
@@ -122,10 +122,10 @@ process_time = 2026-09-04T10:00:00.000Z        ← 补录时刻（晚于 event_t
 ```
 对每条 link:
   event_time   = links.timestamp（link 当时保存的时刻，本地时区）
-  process_time = now()（本次 bootstrap 启动时刻，UTC）
+  process_time = now()（本次 bootstrap 灌入时刻，UTC，同 topic 内严格递增）
 ```
 
-`event_time` 是 link 自己的"出生证"，`process_time` 是 bootstrap 这次批量灌入的"签发时间"——**所有 link 共用一个 process_time，event_time 各不相同**。
+`event_time` 是 link 自己的"出生证"，`process_time` 是 bootstrap 这次批量灌入的"签发时间"——**`event_time` 各不相同；`process_time` 由写入方逐条分配并保证严格递增**（同一毫秒内从第二条起递增 1ms）。若所有 link 共用一个 `process_time`，基于 `process_time` 的推送游标（§10.5「严格大于」比较）在推完第一批后会跳过其余同值事件。
 
 ### 与翻页游标的关系
 
@@ -133,7 +133,7 @@ process_time = 2026-09-04T10:00:00.000Z        ← 补录时刻（晚于 event_t
 - bootstrap 灌历史时 `event_time = links.timestamp`，各 link 不同 → 游标稳定推进
 - 业务调用时 `event_time = entity 创建时刻`，正常情况下不同操作时间不同 → 游标能区分
 
-`process_time` 不参与翻页（bootstrap 时全相同会导致游标卡死——见 §10.1）。
+多端场景（§10.5）**push 游标用 `process_time`**，因此写入方必须保证同 topic 内 `process_time` 严格递增：游标推进采用「严格大于」比较，同值重复会导致排在后面的同值事件被永久跳过。单端场景的 `process_time` 不参与翻页（详见 §10.1/§10.2）。
 
 ### 与协议核心设计原则的关系
 
