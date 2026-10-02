@@ -164,6 +164,116 @@ def post_event():
     ), 201
 
 
+@app.post("/events/batch")
+def post_events_batch():
+    """Batch endpoint per PROTOCOL §4.1.1.
+
+    Body: {"events": [<event>, ...]}. The server writes each event
+    independently (no all-or-nothing atomicity). On ANY single failure
+    the whole batch responds non-2xx so the client leaves its push
+    cursor untouched — duplicate retry is safe via id-based idempotency.
+    """
+    if not require_auth():
+        return err("unauthorized", "missing or invalid Authorization", 401)
+
+    body = request.get_json(silent=True) or {}
+    events = body.get("events")
+    if not isinstance(events, list) or not events:
+        return err("missing_fields", "events array is required", 400)
+    if len(events) > 1000:
+        return err("batch_too_large",
+                   "events array exceeds 1000", 400)
+
+    # Whole-batch validation up-front (per §4.1.1: any required field
+    # missing → reject whole batch, no partial writes).
+    for ev in events:
+        if not isinstance(ev, dict):
+            return err("missing_fields", "event entry must be an object",
+                       400)
+        missing = [
+            k for k, v in {
+                "device_id": ev.get("device_id"),
+                "entity_id": ev.get("entity_id"),
+                "action": ev.get("action"),
+                "event_time": ev.get("event_time"),
+            }.items()
+            if not v
+        ]
+        if missing:
+            return err("missing_fields", "required fields are empty",
+                       400, fields=missing)
+        action = ev.get("action")
+        if action not in VALID_ACTIONS:
+            return err("invalid_action", "action not allowed",
+                       400, action=action,
+                       allowed=sorted(VALID_ACTIONS))
+        if action == "delete":
+            continue
+        if ev.get("data") is None:
+            return err("data_required",
+                       "data required for non-delete actions", 400)
+
+    # All validation passed — proceed to write each event.
+    db = get_db()
+    results = []
+    total_new = 0
+    total_duplicate = 0
+    pt = now_utc()  # single timestamp for the whole batch — keeps id
+                     # stability when the client re-sends the same batch
+                     # with the same client-side process_time values.
+    for ev in events:
+        topic = ev.get("topic") or DEFAULT_TOPIC
+        device_id = ev["device_id"]
+        entity_id = ev["entity_id"]
+        action = ev["action"]
+        event_time = ev["event_time"]
+        data = None if action == "delete" else ev.get("data")
+
+        eid = compute_id(topic, device_id, event_time, entity_id, action)
+        client_id = ev.get("id")
+        if client_id is not None and client_id != eid:
+            return err("id_mismatch",
+                       "client id does not match computed id",
+                       400, expected=eid, received=client_id)
+
+        existing = db.execute(
+            "SELECT * FROM events WHERE id = ?", (eid,)
+        ).fetchone()
+        if existing is not None:
+            results.append({
+                "index": len(results),
+                "status": 200,
+                "id": eid,
+                "process_time": existing["process_time"],
+            })
+            total_duplicate += 1
+            continue
+
+        db.execute(
+            "INSERT INTO events "
+            "(id, topic, process_time, event_time, device_id, entity_id, "
+            "action, data) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            (eid, topic, pt, event_time, device_id, entity_id,
+             action, json.dumps(data) if data is not None else None),
+        )
+        results.append({
+            "index": len(results),
+            "status": 201,
+            "id": eid,
+            "process_time": pt,
+        })
+        total_new += 1
+
+    db.commit()
+    # 201 if all new, 200 if all duplicate or mixed — same body either way.
+    status_code = 201 if total_new > 0 and total_duplicate == 0 else 200
+    return jsonify(
+        results=results,
+        total_new=total_new,
+        total_duplicate=total_duplicate,
+    ), status_code
+
+
 @app.get("/events")
 def get_events():
     if not require_auth():
