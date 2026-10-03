@@ -178,15 +178,19 @@ EventLogClient.get().create(topic, entityId, dataJson);  // SDK 默认 now() 会
 | `device_id` | string | 客户端 | 发起写入的设备 ID |
 | `entity_id` | string | 客户端 | 实体 ID；同一 topic 内应全局唯一 |
 | `action` | enum | 客户端 | `create` \| `update` \| `delete` |
-| `data` | object \| null | 客户端 | 实体全量快照；`delete` 时为 `null` |
+| `data` | object \| null | 客户端 | 实体全量快照（**变更后**状态）；`delete` 时为 `null` |
+| `old` | object \| null | 客户端 | 实体全量快照（**变更前**状态），供 diff / 审计；`create` 时必须为 `null`，`update` / `delete` 可选（写入方拿不到历史状态时可省略）。**不参与 id 计算** |
 
 ### 3.2 action 语义
 
-| action | `data` 约束 | 含义 |
-|--------|------------|------|
-| `create` | 必填，对象 | 实体首次出现，data 是完整初始状态 |
-| `update` | 必填，对象 | 实体内容变更，data 是变更后完整状态（全量替换） |
-| `delete` | 必须为 `null` | 实体被删除（tombstone）；保留在事件流中 |
+| action | `data` 约束（变更后） | `old` 约束（变更前） | 含义 |
+|--------|------------|------------|------|
+| `create` | 必填，对象 | **必须为 `null`**（传了服务端置 null，不报错） | 实体首次出现，data 是完整初始状态 |
+| `update` | 必填，对象 | 可选：变更前完整状态 | 实体内容变更，data 是变更后完整状态（全量替换） |
+| `delete` | 必须为 `null` | 可选：**被删实体最后状态** | 实体被删除（tombstone）；保留在事件流中 |
+
+> **`data` + `old` = 一次变更的「后 / 前」**：`old` 只用于 diff、审计、观测，以及将来做乐观并发（compare-and-swap）的料。
+> **折叠（§5.4 apply_events）只消费 `data`** —— `old` 不参与 LWW 折叠，缺了也不影响状态收敛。
 
 > **全量更新模型**：每次 `update` 都携带 entity 的**完整当前状态**，不是 diff。客户端无需 diff 计算。
 
@@ -240,7 +244,8 @@ Content-Type: application/json
   "data": {
     "title": "Hello",
     "body":  "First sync"
-  }
+  },
+  "old": null    ← 变更前状态（create 必须为 null / 省略）
 }
 ```
 
@@ -252,6 +257,7 @@ Content-Type: application/json
 | `action` 不在 `{create, update, delete}` | `400` (`invalid_action`) |
 | `action ∈ {create, update}` 但 `data` 缺失 | `400` (`data_required`) |
 | `action = delete` 但 `data` 非 null | 服务端**必须**将 `data` 置为 `null`（不忽略） |
+| `action = create` 但 `old` 非 null | 服务端**必须**将 `old` 置为 `null`（不忽略、不报错） |
 | `event_time` 不是合法 ISO-8601 格式 | `400` (`invalid_event_time`) |
 | 客户端上传 `id` 与五元组 sha256 不匹配 | `400` (`id_mismatch`) |
 | 客户端没上传 `id` | 服务端按五元组计算 id 后写入（兼容模式） |
@@ -289,7 +295,8 @@ Content-Type: application/json
   "device_id":     "phone-1",
   "entity_id":     "note-42",
   "action":        "create",
-  "data":          { "title": "Hello", "body": "First sync" }
+  "data":          { "title": "Hello", "body": "First sync" },
+  "old":           null
 }
 ```
 
@@ -894,7 +901,8 @@ CREATE TABLE events (
     device_id     TEXT NOT NULL,
     entity_id     TEXT NOT NULL,
     action        TEXT NOT NULL,
-    data          TEXT              -- JSON 字符串；delete 时为 NULL
+    data          TEXT,             -- JSON 字符串(变更后)；delete 时为 NULL
+    "old"         TEXT              -- JSON 字符串(变更前)；create 时为 NULL
 );
 
 -- 多端场景翻页游标索引（默认）
@@ -913,6 +921,7 @@ CREATE INDEX idx_events_topic_event
 | `event_time` | 客户端声称的本地时区时间 | 原样保存客户端上传值，不归一化 |
 | `process_time` | 客户端本地处理时间（仅参考） | **服务端入库瞬间的 UTC 时间**（权威） |
 | `id` | 客户端算的 sha256 前 16 位 | 原样保存客户端上传值 |
+| `old` | 写入方给的变更前快照（可缺省） | 原样保存；`create` 时强制为 NULL |
 
 #### 双索引的原因
 
