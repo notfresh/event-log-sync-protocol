@@ -42,7 +42,8 @@ def get_db() -> sqlite3.Connection:
                 device_id     TEXT NOT NULL,
                 entity_id     TEXT NOT NULL,
                 action        TEXT NOT NULL,
-                data          TEXT
+                data          TEXT,
+                "old"         TEXT
             )
             """
         )
@@ -54,6 +55,11 @@ def get_db() -> sqlite3.Connection:
             "CREATE INDEX IF NOT EXISTS idx_events_topic_event "
             "ON events(topic, event_time)"
         )
+        # 迁移(PROTOCOL §3.1 新增 old)：CREATE TABLE IF NOT EXISTS 不会给
+        # 已存在的表补列，必须显式 ALTER。幂等：按 PRAGMA 判断列是否已存在。
+        cols = {r["name"] for r in g.db.execute("PRAGMA table_info(events)")}
+        if "old" not in cols:
+            g.db.execute('ALTER TABLE events ADD COLUMN "old" TEXT')
         g.db.commit()
     return g.db
 
@@ -83,6 +89,8 @@ def row_to_dict(row: sqlite3.Row) -> dict:
     out = dict(row)
     if out["data"] is not None:
         out["data"] = json.loads(out["data"])
+    if out.get("old") is not None:
+        out["old"] = json.loads(out["old"])
     return out
 
 
@@ -95,6 +103,20 @@ def err(code: str, message: str, status: int, **extra) -> tuple:
 @app.get("/health")
 def health():
     return jsonify(status="ok")
+
+
+@app.before_request
+def log_auth_for_diag():
+    """Diagnostic: log Authorization header on every non-/health request so
+    we can see what the client actually sent (default Werkzeug access log
+    doesn't include headers).
+    """
+    if request.path in ("/health", "/favicon.ico"):
+        return
+    auth = request.headers.get("Authorization", "<missing>")
+    # Truncate at 50 chars to keep logs readable.
+    print(f"[DIAG] {request.remote_addr} {request.method} {request.path} "
+          f"Authorization={auth[:50]!r} (len={len(auth)})", flush=True)
 
 
 @app.get("/stats")
@@ -179,6 +201,8 @@ def _write_single(body: dict):
     action = body["action"]
     event_time = body["event_time"]
     data = None if action == "delete" else body.get("data")
+    # §3.2: old = 变更前快照;create 恒为 null(传了也不存)
+    old = None if action == "create" else body.get("old")
 
     eid = compute_id(topic, device_id, event_time, entity_id, action)
     # NOTE(id_mismatch 豁免): 不再强制要求 client_id == eid。
@@ -196,9 +220,10 @@ def _write_single(body: dict):
     db.execute(
         "INSERT INTO events "
         "(id, topic, process_time, event_time, device_id, entity_id, "
-        "action, data) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        "action, data, \"old\") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
         (eid, topic, now_utc(), event_time, device_id, entity_id,
-         action, json.dumps(data) if data is not None else None),
+         action, json.dumps(data) if data is not None else None,
+         json.dumps(old) if old is not None else None),
     )
     db.commit()
 
@@ -211,6 +236,7 @@ def _write_single(body: dict):
         entity_id=entity_id,
         action=action,
         data=data,
+        old=old,
     ), 201
 
 
@@ -243,6 +269,7 @@ def _write_batch(events: list):
         action = ev["action"]
         event_time = ev["event_time"]
         data = None if action == "delete" else ev.get("data")
+        old = None if action == "create" else ev.get("old")   # §3.2
 
         eid = compute_id(topic, device_id, event_time, entity_id, action)
         # NOTE: 同样豁免 id_mismatch(原因见 _write_single)
@@ -263,9 +290,10 @@ def _write_batch(events: list):
         db.execute(
             "INSERT INTO events "
             "(id, topic, process_time, event_time, device_id, entity_id, "
-            "action, data) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            "action, data, \"old\") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (eid, topic, pt, event_time, device_id, entity_id,
-             action, json.dumps(data) if data is not None else None),
+             action, json.dumps(data) if data is not None else None,
+             json.dumps(old) if old is not None else None),
         )
         results.append({
             "index": len(results),
